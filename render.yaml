@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mailroom-agent
+    env: python
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: DB_PATH
+        value: /var/data/mailroom.db
+    disks:
+      - name: mailroom-data
+        mountPath: /var/data
+        sizeGB: 1
