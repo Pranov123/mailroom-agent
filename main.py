@@ -4,6 +4,7 @@ import time
 import hashlib
 import sqlite3
 import threading
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -331,10 +332,23 @@ def build_line_map(d):
     return m
 
 
+def _normalize_for_match(s: str) -> str:
+    s = s.replace("\u201c", '"').replace("\u201d", '"')
+    s = s.replace("\u2018", "'").replace("\u2019", "'")
+    s = s.replace("\u2013", "-").replace("\u2014", "-")
+    s = re.sub(r"\s+", " ", s.strip())
+    return s
+
+
 def is_grounded(value: str, cited_texts: list) -> bool:
     if not value:
         return True
-    return any(value in t for t in cited_texts)
+    if any(value in t for t in cited_texts):
+        return True
+    nv = _normalize_for_match(value)
+    if not nv:
+        return False
+    return any(nv in _normalize_for_match(t) for t in cited_texts)
 
 
 def source_provenance_map(d):
