@@ -35,6 +35,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+@app.get("/debug-groq")
+async def debug_groq():
+    info = {"has_key": bool(GROQ_API_KEY), "key_len": len(GROQ_API_KEY) if GROQ_API_KEY else 0, "model": GROQ_MODEL}
+    try:
+        result = call_groq("mailbox: test@x.com\nobjective: test\n--- source s1 | kind=email | provenance=customer | title=t\n[l1] hello, checking on my order")
+        info["success"] = True
+        info["result"] = result
+    except Exception as e:
+        info["success"] = False
+        info["error"] = str(e)
+    return info
 
 
 # ---------- storage ----------
