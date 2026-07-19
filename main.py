@@ -1,10 +1,10 @@
 import os
+import re
 import json
 import time
 import hashlib
 import sqlite3
 import threading
-import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -22,10 +22,10 @@ MAX_BODY_BYTES = 8_000_000
 PROPOSE_DEADLINE_SECONDS = 40  # hard budget inside the 55s request window
 
 _lock = threading.Lock()
-EXECUTOR = ThreadPoolExecutor(max_workers=40)
+EXECUTOR = ThreadPoolExecutor(max_workers=8)
 _http_client = httpx.Client(
-    timeout=10,
-    limits=httpx.Limits(max_connections=40, max_keepalive_connections=40),
+    timeout=15,
+    limits=httpx.Limits(max_connections=8, max_keepalive_connections=8),
 )
 
 app = FastAPI()
@@ -35,17 +35,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-@app.get("/debug-groq")
-async def debug_groq():
-    info = {"has_key": bool(GROQ_API_KEY), "key_len": len(GROQ_API_KEY) if GROQ_API_KEY else 0, "model": GROQ_MODEL}
-    try:
-        result = call_groq("mailbox: test@x.com\nobjective: test\n--- source s1 | kind=email | provenance=customer | title=t\n[l1] hello, checking on my order")
-        info["success"] = True
-        info["result"] = result
-    except Exception as e:
-        info["success"] = False
-        info["error"] = str(e)
-    return info
 
 
 # ---------- storage ----------
@@ -321,15 +310,22 @@ def call_groq(dossier_text: str) -> dict:
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     last_err = None
-    for _ in range(2):
+    for attempt in range(4):
         try:
             r = _http_client.post(GROQ_URL, json=payload, headers=headers)
+            if r.status_code == 429:
+                retry_after = r.headers.get("retry-after")
+                wait = float(retry_after) if retry_after else (0.5 * (2 ** attempt))
+                wait = min(wait, 8.0)
+                time.sleep(wait)
+                last_err = f"429 rate limited (waited {wait}s)"
+                continue
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
             return json.loads(content)
         except Exception as e:
             last_err = e
-            time.sleep(0.2)
+            time.sleep(0.3 * (2 ** attempt))
     raise RuntimeError(f"groq_failed: {last_err}")
 
 
@@ -394,10 +390,8 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
 
     ev = [e for e in (evidence or []) if e in line_map]
     if not ev:
-        ev = list(line_map.keys())  # widen instead of guessing one line
+        ev = list(line_map.keys())
     cited_texts = [line_map[e] for e in ev]
-    # also allow grounding against the FULL dossier, not just cited lines --
-    # a correct fact quoted from an uncited-but-real line should not be treated as fabricated
     all_texts = list(line_map.values())
 
     payload = {}
@@ -408,7 +402,7 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
             payload[k] = v if v in FIXED_ENUM_FIELDS[k] else ""
             continue
         if v and not is_grounded(v, all_texts):
-            v = ""  # drop only this field, keep the action
+            v = ""
         payload[k] = v
 
     tid = target_id if isinstance(target_id, str) and target_id else None
@@ -696,6 +690,19 @@ def handle_commit(body):
 @app.get("/")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/debug-groq")
+async def debug_groq():
+    info = {"has_key": bool(GROQ_API_KEY), "key_len": len(GROQ_API_KEY) if GROQ_API_KEY else 0, "model": GROQ_MODEL}
+    try:
+        result = call_groq("mailbox: test@x.com\nobjective: test\n--- source s1 | kind=email | provenance=customer | title=t\n[l1] hello, checking on my order")
+        info["success"] = True
+        info["result"] = result
+    except Exception as e:
+        info["success"] = False
+        info["error"] = str(e)
+    return info
 
 
 @app.post("/mailroom")
