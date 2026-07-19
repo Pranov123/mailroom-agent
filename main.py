@@ -383,20 +383,21 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
 
     ev = [e for e in (evidence or []) if e in line_map]
     if not ev:
-        ev = [next(iter(line_map.keys()))] if line_map else []
+        ev = list(line_map.keys())  # widen instead of guessing one line
     cited_texts = [line_map[e] for e in ev]
+    # also allow grounding against the FULL dossier, not just cited lines --
+    # a correct fact quoted from an uncited-but-real line should not be treated as fabricated
+    all_texts = list(line_map.values())
 
     payload = {}
-    grounding_failed = False
     for k in schema["payload_keys"]:
         v = (raw_fields or {}).get(k)
         v = v if isinstance(v, str) else ""
         if k in FIXED_ENUM_FIELDS:
             payload[k] = v if v in FIXED_ENUM_FIELDS[k] else ""
             continue
-        if v and not is_grounded(v, cited_texts):
-            grounding_failed = True
-            v = ""
+        if v and not is_grounded(v, all_texts):
+            v = ""  # drop only this field, keep the action
         payload[k] = v
 
     tid = target_id if isinstance(target_id, str) and target_id else None
@@ -406,8 +407,7 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
         tid = "mailroom"
     elif action == "no_action":
         tid = None
-    elif tid and not is_grounded(tid, cited_texts):
-        grounding_failed = True
+    elif tid and not is_grounded(tid, all_texts):
         tid = None
 
     if action == "create_draft":
@@ -423,28 +423,8 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
     if action == "no_action" and payload.get("reasonCode") not in {"ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"}:
         payload["reasonCode"] = "INFORMATIONAL"
 
-    required_nonempty = {
-        "create_draft": ["referenceId"],
-        "update_internal_record": ["sourceEventId", "value"],
-        "send_approved_notice": ["referenceId"],
-        "request_confirmation": [],
-        "quarantine_item": ["artifactId"],
-        "no_action": [],
-    }[action]
-    missing_required = any(not payload.get(k) for k in required_nonempty)
-
-    if grounding_failed or missing_required:
-        if action in ("send_approved_notice", "update_internal_record", "create_draft"):
-            action = "request_confirmation"
-            claimed = cited_texts[0] if cited_texts else ""
-            payload = {
-                "claimedSender": claimed[:200],
-                "questionCode": "VERIFY_REQUEST",
-                "referenceId": "",
-            }
-            tid = None
-        elif action == "quarantine_item" and not payload.get("artifactId"):
-            payload["artifactId"] = dossier_id
+    if action == "quarantine_item" and not payload.get("artifactId"):
+        payload["artifactId"] = dossier_id
 
     if action == "create_draft":
         target = {"kind": "draft_queue", "id": None}
