@@ -4,7 +4,6 @@ import time
 import hashlib
 import sqlite3
 import threading
-import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
@@ -19,9 +18,14 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MAX_BODY_BYTES = 8_000_000
+PROPOSE_DEADLINE_SECONDS = 40  # hard budget inside the 55s request window
 
 _lock = threading.Lock()
-EXECUTOR = ThreadPoolExecutor(max_workers=16)
+EXECUTOR = ThreadPoolExecutor(max_workers=40)
+_http_client = httpx.Client(
+    timeout=10,
+    limits=httpx.Limits(max_connections=40, max_keepalive_connections=40),
+)
 
 app = FastAPI()
 app.add_middleware(
@@ -305,16 +309,15 @@ def call_groq(dossier_text: str) -> dict:
     }
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     last_err = None
-    for _ in range(3):
+    for _ in range(2):
         try:
-            with httpx.Client(timeout=20) as client:
-                r = client.post(GROQ_URL, json=payload, headers=headers)
-                r.raise_for_status()
-                content = r.json()["choices"][0]["message"]["content"]
-                return json.loads(content)
+            r = _http_client.post(GROQ_URL, json=payload, headers=headers)
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"]
+            return json.loads(content)
         except Exception as e:
             last_err = e
-            time.sleep(0.4)
+            time.sleep(0.2)
     raise RuntimeError(f"groq_failed: {last_err}")
 
 
@@ -364,7 +367,6 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
 
     schema = SCHEMAS[action]
 
-    # keep only evidence lineIds that actually exist in this dossier
     ev = [e for e in (evidence or []) if e in line_map]
     if not ev:
         ev = [next(iter(line_map.keys()))] if line_map else []
@@ -385,7 +387,7 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
 
     tid = target_id if isinstance(target_id, str) and target_id else None
     if action == "create_draft":
-        tid = None  # replaced below with mailbox target, always valid
+        tid = None
     elif action == "quarantine_item":
         tid = "mailroom"
     elif action == "no_action":
@@ -394,7 +396,6 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
         grounding_failed = True
         tid = None
 
-    # fill required fixed enum defaults
     if action == "create_draft":
         payload["template"] = "order_status"
     if action == "send_approved_notice":
@@ -408,7 +409,6 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
     if action == "no_action" and payload.get("reasonCode") not in {"ALREADY_COMPLETED", "DUPLICATE", "INFORMATIONAL"}:
         payload["reasonCode"] = "INFORMATIONAL"
 
-    # if a value essential to the action is missing/ungrounded, degrade safely
     required_nonempty = {
         "create_draft": ["referenceId"],
         "update_internal_record": ["sourceEventId", "value"],
@@ -422,13 +422,9 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
     if grounding_failed or missing_required:
         if action in ("send_approved_notice", "update_internal_record", "create_draft"):
             action = "request_confirmation"
-            schema = SCHEMAS[action]
-            claimed = None
-            for cand in cited_texts:
-                claimed = cand
-                break
+            claimed = cited_texts[0] if cited_texts else ""
             payload = {
-                "claimedSender": (claimed or "")[:200],
+                "claimedSender": claimed[:200],
                 "questionCode": "VERIFY_REQUEST",
                 "referenceId": "",
             }
@@ -437,7 +433,7 @@ def enforce_schema_grounded(action, raw_fields, target_id, evidence, line_map, d
             payload["artifactId"] = dossier_id
 
     if action == "create_draft":
-        target = {"kind": "draft_queue", "id": None}  # overwritten by caller with mailbox
+        target = {"kind": "draft_queue", "id": None}
     elif SCHEMAS[action]["target_kind"] is None:
         target = None
     else:
@@ -462,10 +458,8 @@ def decide_for_dossier(d: dict) -> dict:
     target_id = result.get("target_id")
     evidence = result.get("evidence", []) or []
 
-    # hard safety net: injection signature anywhere forces quarantine
     all_text = " ".join(line_map.values()).lower()
     if any(sig in all_text for sig in INJECTION_SIGNATURES) and action != "quarantine_item":
-        provmap = source_provenance_map(d)
         unsafe_source, unsafe_line = None, None
         for s in d.get("sources", []):
             for ln in s.get("lines", []):
@@ -479,7 +473,6 @@ def decide_for_dossier(d: dict) -> dict:
         target_id = "mailroom"
         evidence = [unsafe_line] if unsafe_line else evidence
 
-    # send_approved_notice requires genuinely trusted provenance, not just model's say-so
     if action == "send_approved_notice":
         provmap = source_provenance_map(d)
         trusted = any(any(h in (p or "").lower() for h in TRUSTED_PROVENANCE_HINTS) for p in provmap.values())
@@ -513,6 +506,8 @@ def safe_decide(d: dict) -> dict:
             r["action"], r.get("fields", {}), r.get("target_id"), r.get("evidence", []),
             line_map, d["dossierId"],
         )
+        if action == "create_draft" and target is not None:
+            target = {"kind": "draft_queue", "id": f"mailbox:{d.get('mailbox', 'unknown')}"}
         return {
             "dossierId": d["dossierId"],
             "callId": make_call_id(d["dossierId"]),
@@ -521,6 +516,26 @@ def safe_decide(d: dict) -> dict:
             "payload": payload,
             "evidence": ev,
         }
+
+
+def build_fallback_proposal(d: dict) -> dict:
+    """Used when a future times out under the global deadline — never blocks the response."""
+    line_map = build_line_map(d)
+    r = fallback_decision(d, line_map)
+    action, target, payload, ev = enforce_schema_grounded(
+        r["action"], r.get("fields", {}), r.get("target_id"), r.get("evidence", []),
+        line_map, d["dossierId"],
+    )
+    if action == "create_draft" and target is not None:
+        target = {"kind": "draft_queue", "id": f"mailbox:{d.get('mailbox', 'unknown')}"}
+    return {
+        "dossierId": d["dossierId"],
+        "callId": make_call_id(d["dossierId"]),
+        "action": action,
+        "target": target,
+        "payload": payload,
+        "evidence": ev,
+    }
 
 
 # ---------- request validation ----------
@@ -571,6 +586,8 @@ def handle_propose(body):
             return JSONResponse(status_code=409, content={"error": "evaluation_conflict"})
         return JSONResponse(status_code=200, content=existing["response"])
 
+    deadline = time.time() + PROPOSE_DEADLINE_SECONDS
+
     results = [None] * len(dossiers)
     fps = [sha256_hex(canonical_json_bytes(d)) for d in dossiers]
     futures = {}
@@ -582,11 +599,12 @@ def handle_propose(body):
         else:
             futures[i] = EXECUTOR.submit(safe_decide, d)
 
-    for i, fut in futures.items():
+    for i, fut in list(futures.items()):
+        remaining = max(0.3, deadline - time.time())
         try:
-            proposal = fut.result(timeout=45)
+            proposal = fut.result(timeout=remaining)
         except Exception:
-            proposal = safe_decide(dossiers[i])
+            proposal = build_fallback_proposal(dossiers[i])
         store_cached_proposal(dossiers[i]["dossierId"], fps[i], proposal)
         results[i] = proposal
 
